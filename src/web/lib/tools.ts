@@ -3,13 +3,13 @@ import {
   Maximize2, RefreshCw, Eraser, Crop,
   FileSpreadsheet, Presentation,
   Braces, FileJson, FileCode,
-  Video, Music,
+  Video, Music, FileAudio,
   Type, CaseSensitive, AlignLeft,
   Lock, Unlock, QrCode, Binary, Palette, Hash, Clock,
-  FileImage, Code,
+  FileImage, Code, BookMarked,
 } from "lucide-react";
 
-export type ToolCategory = "pdf" | "image" | "document" | "data" | "video-audio" | "text";
+export type ToolCategory = "pdf" | "image" | "document" | "data" | "video-audio" | "text" | "markdown";
 
 export interface Tool {
   id: string;
@@ -36,6 +36,7 @@ export const categories: Category[] = [
   { id: "document", name: "Document Tools", description: "Convert documents to PDF and back", color: "#d4943a", bgColor: "rgba(212,148,58,0.08)", borderColor: "rgba(212,148,58,0.15)" },
   { id: "data", name: "Data Tools", description: "Convert between JSON, CSV, XML and YAML", color: "#3b82a0", bgColor: "rgba(59,130,160,0.08)", borderColor: "rgba(59,130,160,0.15)" },
   { id: "video-audio", name: "Video & Audio", description: "Compress, convert and extract media", color: "#7c5db8", bgColor: "rgba(124,93,184,0.08)", borderColor: "rgba(124,93,184,0.15)" },
+  { id: "markdown", name: "Markdown", description: "Convert and export Markdown documents", color: "#1f6feb", bgColor: "rgba(31,111,235,0.08)", borderColor: "rgba(31,111,235,0.15)" },
   { id: "text", name: "Text Tools", description: "Count words, change case, generate text and more", color: "#6b7280", bgColor: "rgba(107,114,128,0.08)", borderColor: "rgba(107,114,128,0.15)" },
 ];
 
@@ -71,10 +72,14 @@ export const tools: Tool[] = [
   { id: "base64", name: "Base64 Encode/Decode", description: "Encode text or files to Base64 and back", category: "data", icon: Binary, processing: "client", acceptedTypes: "" },
   { id: "markdown-to-html", name: "Markdown to HTML", description: "Convert Markdown text to clean HTML", category: "data", icon: Code, processing: "client", acceptedTypes: ".md" },
 
-  // Video/Audio Tools (3)
+  // Video/Audio Tools (4)
   { id: "compress-video", name: "Compress Video", description: "Reduce video file size for sharing", category: "video-audio", icon: Video, processing: "server", acceptedTypes: ".mp4,.mov,.avi,.mkv,.webm" },
   { id: "convert-video", name: "Convert Video", description: "Convert between video formats", category: "video-audio", icon: RefreshCw, processing: "server", acceptedTypes: ".mp4,.mov,.avi,.mkv,.webm" },
   { id: "extract-audio", name: "Extract Audio", description: "Extract audio track from video files", category: "video-audio", icon: Music, processing: "server", acceptedTypes: ".mp4,.mov,.avi,.mkv,.webm" },
+  { id: "extract-text-from-audio", name: "Extract Text from Audio", description: "Transcribe spoken audio to text from MP3 or M4A files", category: "video-audio", icon: FileAudio, processing: "server", acceptedTypes: ".mp3,.m4a" },
+
+  // Markdown Tools (1)
+  { id: "markdown-to-pdf", name: "Markdown to PDF", description: "Convert Markdown to PDF using GitHub-flavored styling", category: "markdown", icon: BookMarked, processing: "client", acceptedTypes: ".md,.markdown" },
 
   // Text Tools (7)
   { id: "word-counter", name: "Word Counter", description: "Count words, characters, sentences and paragraphs", category: "text", icon: Type, processing: "client", acceptedTypes: "" },

@@ -654,6 +654,677 @@ export function markdownToHtml(md: string): string {
   return `<p>${html}</p>`.replace(/<p><\/p>/g, '').replace(/<p>(<h[1-6]>)/g, '$1').replace(/(<\/h[1-6]>)<\/p>/g, '$1');
 }
 
+// ============ MARKDOWN TOOLS ============
+
+// Convert Markdown to PDF with GitHub-flavored styling.
+// Layouts text using pdf-lib's standard fonts in a single pass — supports
+// headings, paragraphs, bold/italic/inline-code, fenced code blocks, lists
+// (ordered + unordered + task lists), blockquotes, horizontal rules, links,
+// and pipe tables. Images and HTML passthrough are skipped.
+export async function markdownToPdf(md: string): Promise<Blob> {
+  const doc = await PDFDocument.create();
+  const helv = await doc.embedFont(StandardFonts.Helvetica);
+  const helvBold = await doc.embedFont(StandardFonts.HelveticaBold);
+  const helvItalic = await doc.embedFont(StandardFonts.HelveticaOblique);
+  const helvBoldItalic = await doc.embedFont(StandardFonts.HelveticaBoldOblique);
+  const mono = await doc.embedFont(StandardFonts.Courier);
+  const monoBold = await doc.embedFont(StandardFonts.CourierBold);
+
+  // GitHub palette
+  const colorText = rgb(0.094, 0.106, 0.122);     // #181a1f-ish (#1f2328)
+  const colorMuted = rgb(0.396, 0.439, 0.486);    // #656d76
+  const colorLink = rgb(0.035, 0.365, 0.847);     // #0969da
+  const colorBorder = rgb(0.851, 0.871, 0.894);   // #d8dee4 (#d0d7de)
+  const colorCodeBg = rgb(0.961, 0.969, 0.976);   // #f6f8fa
+  const colorQuoteBar = rgb(0.851, 0.871, 0.894); // #d0d7de
+  const colorRule = rgb(0.851, 0.871, 0.894);
+
+  // Page geometry — Letter
+  const pageW = 612;
+  const pageH = 792;
+  const marginX = 56;
+  const marginY = 64;
+  const contentW = pageW - marginX * 2;
+  const baseFontSize = 11;
+  const lineHeight = 1.5;
+
+  let page = doc.addPage([pageW, pageH]);
+  let cursorY = pageH - marginY;
+
+  const ensureSpace = (needed: number) => {
+    if (cursorY - needed < marginY) {
+      page = doc.addPage([pageW, pageH]);
+      cursorY = pageH - marginY;
+    }
+  };
+
+  // Sanitise Markdown — convert tabs, normalise line endings, and strip any
+  // glyphs that pdf-lib's StandardFonts (WinAnsi) can't encode. We must do
+  // this BEFORE any width measurement or wrap call, because
+  // `font.widthOfTextAtSize` itself throws on unencodable codepoints — so
+  // sanitising only at draw time is too late.
+  const source = sanitiseForStdFont(
+    md.replace(/\r\n/g, "\n").replace(/\t/g, "    ")
+  );
+
+  type InlineSeg = { text: string; bold?: boolean; italic?: boolean; code?: boolean; link?: string };
+
+  const parseInline = (text: string): InlineSeg[] => {
+    const segs: InlineSeg[] = [];
+    let i = 0;
+    let buf = "";
+    const flush = () => { if (buf) { segs.push({ text: buf }); buf = ""; } };
+
+    while (i < text.length) {
+      const ch = text[i];
+      const rest = text.slice(i);
+
+      // Inline code: `code` (no nesting)
+      if (ch === "`") {
+        const end = text.indexOf("`", i + 1);
+        if (end !== -1) {
+          flush();
+          segs.push({ text: text.slice(i + 1, end), code: true });
+          i = end + 1;
+          continue;
+        }
+      }
+
+      // Image — skip, render alt as plain text
+      if (ch === "!" && text[i + 1] === "[") {
+        const close = text.indexOf("]", i + 2);
+        if (close !== -1 && text[close + 1] === "(") {
+          const parenEnd = text.indexOf(")", close + 2);
+          if (parenEnd !== -1) {
+            flush();
+            const alt = text.slice(i + 2, close);
+            segs.push({ text: alt ? `[${alt}]` : "[image]", italic: true });
+            i = parenEnd + 1;
+            continue;
+          }
+        }
+      }
+
+      // Link [text](url)
+      if (ch === "[") {
+        const close = text.indexOf("]", i + 1);
+        if (close !== -1 && text[close + 1] === "(") {
+          const parenEnd = text.indexOf(")", close + 2);
+          if (parenEnd !== -1) {
+            flush();
+            const linkText = text.slice(i + 1, close);
+            const url = text.slice(close + 2, parenEnd);
+            const inner = parseInline(linkText);
+            inner.forEach((s) => segs.push({ ...s, link: url }));
+            i = parenEnd + 1;
+            continue;
+          }
+        }
+      }
+
+      // Bold+italic ***text***
+      if (rest.startsWith("***")) {
+        const end = text.indexOf("***", i + 3);
+        if (end !== -1) {
+          flush();
+          segs.push({ text: text.slice(i + 3, end), bold: true, italic: true });
+          i = end + 3;
+          continue;
+        }
+      }
+
+      // Bold **text** or __text__
+      if (rest.startsWith("**") || rest.startsWith("__")) {
+        const marker = rest.slice(0, 2);
+        const end = text.indexOf(marker, i + 2);
+        if (end !== -1) {
+          flush();
+          segs.push({ text: text.slice(i + 2, end), bold: true });
+          i = end + 2;
+          continue;
+        }
+      }
+
+      // Italic *text* or _text_
+      if ((ch === "*" || ch === "_") && text[i + 1] !== ch) {
+        const end = text.indexOf(ch, i + 1);
+        if (end !== -1 && end > i + 1) {
+          flush();
+          segs.push({ text: text.slice(i + 1, end), italic: true });
+          i = end + 1;
+          continue;
+        }
+      }
+
+      // Strikethrough ~~text~~ — render as plain (pdf-lib has no strikethrough); fall through
+      if (rest.startsWith("~~")) {
+        const end = text.indexOf("~~", i + 2);
+        if (end !== -1) {
+          flush();
+          segs.push({ text: text.slice(i + 2, end), italic: true });
+          i = end + 2;
+          continue;
+        }
+      }
+
+      // Autolink <http://...>
+      if (ch === "<") {
+        const end = text.indexOf(">", i + 1);
+        if (end !== -1) {
+          const inner = text.slice(i + 1, end);
+          if (/^https?:\/\//i.test(inner)) {
+            flush();
+            segs.push({ text: inner, link: inner });
+            i = end + 1;
+            continue;
+          }
+        }
+      }
+
+      buf += ch;
+      i++;
+    }
+    flush();
+    return segs;
+  };
+
+  const fontFor = (s: InlineSeg) => {
+    if (s.code) return s.bold ? monoBold : mono;
+    if (s.bold && s.italic) return helvBoldItalic;
+    if (s.bold) return helvBold;
+    if (s.italic) return helvItalic;
+    return helv;
+  };
+
+  // Wrap segments to lines fitting maxWidth — yields { width, segs } per line
+  const wrapSegments = (segs: InlineSeg[], maxWidth: number, fontSize: number) => {
+    const lines: { width: number; parts: { seg: InlineSeg; text: string; width: number }[] }[] = [];
+    let current: { seg: InlineSeg; text: string; width: number }[] = [];
+    let currentW = 0;
+    const spaceWidth = (s: InlineSeg) => fontFor(s).widthOfTextAtSize(" ", fontSize);
+
+    for (const seg of segs) {
+      // Split by whitespace but preserve explicit newlines from hard breaks
+      const tokens = seg.text.split(/(\s+)/);
+      for (const tok of tokens) {
+        if (tok === "") continue;
+        const isSpace = /^\s+$/.test(tok);
+        const w = fontFor(seg).widthOfTextAtSize(tok, fontSize);
+        if (isSpace) {
+          if (current.length > 0 && currentW + w <= maxWidth) {
+            current.push({ seg, text: " ", width: spaceWidth(seg) });
+            currentW += spaceWidth(seg);
+          }
+          continue;
+        }
+        if (currentW + w > maxWidth && current.length > 0) {
+          // Trim trailing space
+          while (current.length && /^\s+$/.test(current[current.length - 1].text)) {
+            currentW -= current[current.length - 1].width;
+            current.pop();
+          }
+          lines.push({ width: currentW, parts: current });
+          current = [];
+          currentW = 0;
+        }
+        // Long-word break
+        if (w > maxWidth) {
+          let chunk = "";
+          let chunkW = 0;
+          for (const ch of tok) {
+            const cw = fontFor(seg).widthOfTextAtSize(ch, fontSize);
+            if (chunkW + cw > maxWidth && chunk) {
+              current.push({ seg, text: chunk, width: chunkW });
+              currentW += chunkW;
+              lines.push({ width: currentW, parts: current });
+              current = [];
+              currentW = 0;
+              chunk = ch;
+              chunkW = cw;
+            } else {
+              chunk += ch;
+              chunkW += cw;
+            }
+          }
+          if (chunk) {
+            current.push({ seg, text: chunk, width: chunkW });
+            currentW += chunkW;
+          }
+        } else {
+          current.push({ seg, text: tok, width: w });
+          currentW += w;
+        }
+      }
+    }
+    if (current.length) {
+      while (current.length && /^\s+$/.test(current[current.length - 1].text)) {
+        currentW -= current[current.length - 1].width;
+        current.pop();
+      }
+      if (current.length) lines.push({ width: currentW, parts: current });
+    }
+    return lines;
+  };
+
+  const drawLine = (
+    parts: { seg: InlineSeg; text: string; width: number }[],
+    x: number,
+    y: number,
+    fontSize: number,
+    defaultColor = colorText
+  ) => {
+    let dx = x;
+    for (const p of parts) {
+      const f = fontFor(p.seg);
+      const c = p.seg.link ? colorLink : defaultColor;
+      // Draw inline code background
+      if (p.seg.code && p.text.trim()) {
+        page.drawRectangle({
+          x: dx - 1,
+          y: y - 2,
+          width: p.width + 2,
+          height: fontSize + 2,
+          color: colorCodeBg,
+        });
+      }
+      // Sanitise glyphs that StandardFonts can't render (smart quotes, em-dash etc.)
+      const safe = sanitiseForStdFont(p.text);
+      page.drawText(safe, { x: dx, y, size: fontSize, font: f, color: c });
+      // Underline links
+      if (p.seg.link && p.text.trim()) {
+        page.drawLine({
+          start: { x: dx, y: y - 1 },
+          end: { x: dx + p.width, y: y - 1 },
+          color: colorLink,
+          thickness: 0.5,
+        });
+      }
+      dx += p.width;
+    }
+  };
+
+  const drawInlineBlock = (
+    segs: InlineSeg[],
+    x: number,
+    maxWidth: number,
+    fontSize: number,
+    color = colorText,
+    afterSpacing = 6
+  ) => {
+    const lh = fontSize * lineHeight;
+    const lines = wrapSegments(segs, maxWidth, fontSize);
+    for (const line of lines) {
+      ensureSpace(lh);
+      cursorY -= fontSize;
+      drawLine(line.parts, x, cursorY, fontSize, color);
+      cursorY -= lh - fontSize;
+    }
+    cursorY -= afterSpacing;
+  };
+
+  // Block-level parse — line-by-line state machine
+  const lines = source.split("\n");
+  let lineIdx = 0;
+
+  while (lineIdx < lines.length) {
+    let line = lines[lineIdx];
+
+    // Fenced code block ``` or ~~~
+    const fence = line.match(/^(\s*)(`{3,}|~{3,})\s*([\w+-]*)\s*$/);
+    if (fence) {
+      const fenceMark = fence[2];
+      const codeLines: string[] = [];
+      lineIdx++;
+      while (lineIdx < lines.length) {
+        const close = lines[lineIdx].match(/^(\s*)([`~]{3,})\s*$/);
+        if (close && close[2][0] === fenceMark[0] && close[2].length >= fenceMark.length) {
+          lineIdx++;
+          break;
+        }
+        codeLines.push(lines[lineIdx]);
+        lineIdx++;
+      }
+      const fontSize = 9.5;
+      const lh = fontSize * 1.45;
+      const padX = 10;
+      const padY = 8;
+      const blockH = codeLines.length * lh + padY * 2;
+      ensureSpace(blockH + 6);
+      const blockTop = cursorY;
+      page.drawRectangle({
+        x: marginX,
+        y: cursorY - blockH,
+        width: contentW,
+        height: blockH,
+        color: colorCodeBg,
+        borderColor: colorBorder,
+        borderWidth: 0.5,
+      });
+      let ty = blockTop - padY - fontSize;
+      for (const cl of codeLines) {
+        // Hard wrap at content width
+        const text = sanitiseForStdFont(cl);
+        const maxChars = Math.floor((contentW - padX * 2) / mono.widthOfTextAtSize("M", fontSize));
+        if (text.length <= maxChars) {
+          page.drawText(text, { x: marginX + padX, y: ty, size: fontSize, font: mono, color: colorText });
+        } else {
+          for (let s = 0; s < text.length; s += maxChars) {
+            if (s > 0) {
+              ensureSpace(lh);
+              ty -= lh;
+            }
+            page.drawText(text.slice(s, s + maxChars), { x: marginX + padX, y: ty, size: fontSize, font: mono, color: colorText });
+          }
+        }
+        ty -= lh;
+      }
+      cursorY = blockTop - blockH - 8;
+      continue;
+    }
+
+    // Horizontal rule (3+ matching - * or _ chars, optionally separated by spaces)
+    if (/^\s*(?:-\s*){3,}$|^\s*(?:\*\s*){3,}$|^\s*(?:_\s*){3,}$/.test(line)) {
+      ensureSpace(14);
+      cursorY -= 6;
+      page.drawLine({
+        start: { x: marginX, y: cursorY },
+        end: { x: marginX + contentW, y: cursorY },
+        color: colorRule,
+        thickness: 0.5,
+      });
+      cursorY -= 10;
+      lineIdx++;
+      continue;
+    }
+
+    // Heading
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      const level = heading[1].length;
+      const sizeMap = [22, 18, 15, 13, 12, 11];
+      const fontSize = sizeMap[level - 1];
+      const segs = parseInline(heading[2]);
+      const topPad = level <= 2 ? 12 : 8;
+      const bottomPad = level <= 2 ? 6 : 4;
+      cursorY -= topPad;
+      const lh = fontSize * 1.25;
+      const wrapped = wrapSegments(segs, contentW, fontSize);
+      for (const wl of wrapped) {
+        ensureSpace(lh);
+        cursorY -= fontSize;
+        // Render with bold variant of each seg
+        const boldedParts = wl.parts.map((p) => ({
+          seg: { ...p.seg, bold: true },
+          text: p.text,
+          width: (p.seg.code ? (p.seg.bold ? monoBold : mono) : helvBold).widthOfTextAtSize(p.text, fontSize),
+        }));
+        drawLine(boldedParts, marginX, cursorY, fontSize, colorText);
+        cursorY -= lh - fontSize;
+      }
+      // Underline for h1/h2 (GitHub style)
+      if (level <= 2) {
+        cursorY -= 2;
+        page.drawLine({
+          start: { x: marginX, y: cursorY },
+          end: { x: marginX + contentW, y: cursorY },
+          color: colorBorder,
+          thickness: 0.5,
+        });
+      }
+      cursorY -= bottomPad;
+      lineIdx++;
+      continue;
+    }
+
+    // Blockquote — collect contiguous > lines
+    if (/^\s*>/.test(line)) {
+      const quoteLines: string[] = [];
+      while (lineIdx < lines.length && /^\s*>/.test(lines[lineIdx])) {
+        quoteLines.push(lines[lineIdx].replace(/^\s*>\s?/, ""));
+        lineIdx++;
+      }
+      const quoteText = quoteLines.join(" ").trim();
+      const segs = parseInline(quoteText);
+      const fontSize = baseFontSize;
+      const lh = fontSize * lineHeight;
+      const indent = 16;
+      const wrapped = wrapSegments(segs, contentW - indent - 8, fontSize);
+      const blockH = wrapped.length * lh + 6;
+      ensureSpace(blockH);
+      const top = cursorY;
+      page.drawRectangle({
+        x: marginX,
+        y: cursorY - blockH,
+        width: 3,
+        height: blockH,
+        color: colorQuoteBar,
+      });
+      let ty = top;
+      for (const wl of wrapped) {
+        ty -= fontSize;
+        drawLine(wl.parts, marginX + indent, ty, fontSize, colorMuted);
+        ty -= lh - fontSize;
+      }
+      cursorY = top - blockH - 4;
+      continue;
+    }
+
+    // Pipe table — header | --- | rows
+    if (/^\s*\|.+\|\s*$/.test(line) && lineIdx + 1 < lines.length && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/.test(lines[lineIdx + 1])) {
+      const splitRow = (l: string) =>
+        l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+      const header = splitRow(line);
+      lineIdx += 2; // skip header + separator
+      const rows: string[][] = [];
+      while (lineIdx < lines.length && /^\s*\|.+\|\s*$/.test(lines[lineIdx])) {
+        rows.push(splitRow(lines[lineIdx]));
+        lineIdx++;
+      }
+      const cols = header.length;
+      const colW = contentW / cols;
+      const fontSize = baseFontSize;
+      const padX = 6;
+      const padY = 5;
+
+      const renderRow = (cells: string[], bold: boolean) => {
+        const cellLines = cells.map((c) =>
+          wrapSegments(parseInline(c), colW - padX * 2, fontSize)
+        );
+        const maxLines = Math.max(1, ...cellLines.map((cl) => cl.length));
+        const rowH = maxLines * fontSize * lineHeight + padY * 2;
+        ensureSpace(rowH);
+        const top = cursorY;
+        // Cell borders
+        for (let i = 0; i <= cols; i++) {
+          const x = marginX + i * colW;
+          page.drawLine({
+            start: { x, y: top },
+            end: { x, y: top - rowH },
+            color: colorBorder,
+            thickness: 0.5,
+          });
+        }
+        page.drawLine({ start: { x: marginX, y: top }, end: { x: marginX + contentW, y: top }, color: colorBorder, thickness: 0.5 });
+        page.drawLine({ start: { x: marginX, y: top - rowH }, end: { x: marginX + contentW, y: top - rowH }, color: colorBorder, thickness: 0.5 });
+
+        if (bold) {
+          page.drawRectangle({
+            x: marginX + 0.5,
+            y: top - rowH + 0.5,
+            width: contentW - 1,
+            height: rowH - 1,
+            color: colorCodeBg,
+          });
+        }
+
+        for (let ci = 0; ci < cols; ci++) {
+          let ty = top - padY;
+          const lns = cellLines[ci];
+          for (const wl of lns) {
+            ty -= fontSize;
+            const parts = bold
+              ? wl.parts.map((p) => ({
+                  seg: { ...p.seg, bold: true },
+                  text: p.text,
+                  width: (p.seg.code ? monoBold : helvBold).widthOfTextAtSize(p.text, fontSize),
+                }))
+              : wl.parts;
+            drawLine(parts, marginX + ci * colW + padX, ty, fontSize, colorText);
+            ty -= fontSize * lineHeight - fontSize;
+          }
+        }
+        cursorY = top - rowH;
+      };
+
+      renderRow(header, true);
+      for (const r of rows) {
+        // Pad short rows
+        while (r.length < cols) r.push("");
+        renderRow(r.slice(0, cols), false);
+      }
+      cursorY -= 8;
+      continue;
+    }
+
+    // Lists — collect contiguous list items (supports nested via leading spaces)
+    const ulMatch = line.match(/^(\s*)([-*+])\s+(.*)$/);
+    const olMatch = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
+    if (ulMatch || olMatch) {
+      type Item = { indent: number; ordered: boolean; marker: string; text: string; checked?: boolean };
+      const items: Item[] = [];
+      while (lineIdx < lines.length) {
+        const cur = lines[lineIdx];
+        const u = cur.match(/^(\s*)([-*+])\s+(.*)$/);
+        const o = cur.match(/^(\s*)(\d+)\.\s+(.*)$/);
+        if (!u && !o) {
+          // Continuation line for previous item (indented)
+          if (items.length > 0 && /^\s+\S/.test(cur) && cur.trim() !== "") {
+            items[items.length - 1].text += " " + cur.trim();
+            lineIdx++;
+            continue;
+          }
+          break;
+        }
+        const m = (u || o)!;
+        const indent = Math.floor(m[1].length / 2);
+        const ordered = !!o;
+        let text = m[3];
+        let checked: boolean | undefined;
+        const taskMatch = text.match(/^\[([ xX])\]\s+(.*)$/);
+        if (taskMatch) {
+          checked = taskMatch[1].toLowerCase() === "x";
+          text = taskMatch[2];
+        }
+        items.push({ indent, ordered, marker: m[2], text, checked });
+        lineIdx++;
+      }
+      const fontSize = baseFontSize;
+      const lh = fontSize * lineHeight;
+      const counters: Record<number, number> = {};
+      for (const it of items) {
+        counters[it.indent] = (counters[it.indent] || 0) + 1;
+        // Reset deeper counters when item appears
+        for (const k of Object.keys(counters).map(Number)) if (k > it.indent) delete counters[k];
+        const indentPx = 14 + it.indent * 18;
+        const bullet = it.checked !== undefined
+          ? (it.checked ? "[x]" : "[ ]")
+          : it.ordered
+            ? `${counters[it.indent]}.`
+            : "•";
+        const segs = parseInline(it.text);
+        const wrapped = wrapSegments(segs, contentW - indentPx - 12, fontSize);
+        for (let li = 0; li < wrapped.length; li++) {
+          ensureSpace(lh);
+          cursorY -= fontSize;
+          if (li === 0) {
+            page.drawText(sanitiseForStdFont(bullet), {
+              x: marginX + indentPx - 12,
+              y: cursorY,
+              size: fontSize,
+              font: it.checked !== undefined ? mono : helv,
+              color: colorText,
+            });
+          }
+          drawLine(wrapped[li].parts, marginX + indentPx, cursorY, fontSize);
+          cursorY -= lh - fontSize;
+        }
+      }
+      cursorY -= 6;
+      continue;
+    }
+
+    // Blank line — paragraph break already handled below
+    if (line.trim() === "") {
+      lineIdx++;
+      continue;
+    }
+
+    // Paragraph — gather contiguous non-blank, non-block lines
+    const para: string[] = [line];
+    lineIdx++;
+    while (lineIdx < lines.length) {
+      const next = lines[lineIdx];
+      if (
+        next.trim() === "" ||
+        /^#{1,6}\s+/.test(next) ||
+        /^\s*>/.test(next) ||
+        /^(\s*)([-*+])\s+/.test(next) ||
+        /^(\s*)\d+\.\s+/.test(next) ||
+        /^\s*([-*_])\s*\1\s*\1/.test(next) ||
+        /^(\s*)(`{3,}|~{3,})/.test(next) ||
+        (/^\s*\|.+\|\s*$/.test(next) && lineIdx + 1 < lines.length && /^\s*\|?\s*:?-+:?/.test(lines[lineIdx + 1]))
+      ) break;
+      para.push(next);
+      lineIdx++;
+    }
+    // GFM hard line break: line ending with two spaces
+    const paraText = para
+      .map((l, i) => (l.endsWith("  ") && i < para.length - 1 ? l.trimEnd() + "\n" : l))
+      .join(" ")
+      .replace(/\s*\n\s*/g, "\n");
+
+    // Split on hard breaks, render each as its own inline block
+    const chunks = paraText.split("\n");
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const segs = parseInline(chunks[ci]);
+      drawInlineBlock(segs, marginX, contentW, baseFontSize, colorText, ci === chunks.length - 1 ? 8 : 2);
+    }
+  }
+
+  const bytes = await doc.save();
+  return new Blob([bytes], { type: "application/pdf" });
+}
+
+// pdf-lib's StandardFonts (WinAnsi) can't encode glyphs outside its ~256-char
+// set — replace common Unicode punctuation with ASCII equivalents so we don't
+// throw on smart quotes, em-dashes, ellipses etc. Anything still unencodable
+// is replaced with '?'.
+function sanitiseForStdFont(text: string): string {
+  return text
+    // Smart quotes
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"')
+    // Dashes (en, em, minus)
+    .replace(/[–—−]/g, "-")
+    // Ellipsis
+    .replace(/…/g, "...")
+    // Bullets and middle-dots
+    .replace(/[•·‧]/g, "*")
+    // Arrows -> ASCII
+    .replace(/[→➜➤]/g, "->")
+    .replace(/←/g, "<-")
+    .replace(/↔/g, "<->")
+    .replace(/⇒/g, "=>")
+    .replace(/⇐/g, "<=")
+    // NBSP and assorted spaces -> regular space
+    .replace(/[  -   　]/g, " ")
+    // Zero-width marks and bidi controls -> drop
+    .replace(/[​-‏‪-‮⁠﻿]/g, "")
+    // Anything else outside Latin-1 -> '?'
+    .replace(/[^\x00-\xFF]/g, "?");
+}
+
+
 // ============ TEXT TOOLS ============
 
 export function countWords(text: string) {

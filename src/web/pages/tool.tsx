@@ -14,7 +14,7 @@ import {
   pdfToWord, compressPdf, pdfToImages, removeBackground,
   compressImage, resizeImage, convertImage,
   jsonToCsv, csvToJson, xmlToJson, jsonToYaml, yamlToJson,
-  base64Encode, base64Decode, markdownToHtml,
+  base64Encode, base64Decode, markdownToHtml, markdownToPdf,
   countWords, convertCase, generateLorem,
   generateHash, hexToRgb, rgbToHex, rgbToHsl,
   timestampToDate, dateToTimestamp,
@@ -103,6 +103,7 @@ function FileToolUI({ tool, category }: { tool: any; category: any }) {
   const [resizeH, setResizeH] = useState(600);
   const [quality, setQuality] = useState(60);
   const [pdfPassword, setPdfPassword] = useState("");
+  const [elevenLabsKey, setElevenLabsKey] = useState("");
 
   const isMultiple = tool.id === "merge-pdf" || tool.id === "image-to-pdf";
 
@@ -148,6 +149,11 @@ function FileToolUI({ tool, category }: { tool: any; category: any }) {
         case "compress-image": { setResult(await compressImage(files[0], quality)); break; }
         case "resize-image": { setResult(await resizeImage(files[0], resizeW, resizeH)); break; }
         case "convert-image": { setResult(await convertImage(files[0], targetFormat)); break; }
+        case "markdown-to-pdf": {
+          const text = await files[0].text();
+          setResult(await markdownToPdf(text));
+          break;
+        }
         case "crop-image": {
           const img = new Image();
           const blob = await new Promise<Blob>((resolve) => {
@@ -172,6 +178,9 @@ function FileToolUI({ tool, category }: { tool: any; category: any }) {
           files.forEach((f) => formData.append("files", f));
           formData.append("toolId", tool.id);
           formData.append("options", JSON.stringify({ rotation, watermarkText, targetFormat, quality }));
+          if (tool.id === "extract-text-from-audio" && elevenLabsKey.trim()) {
+            formData.append("apiKey", elevenLabsKey.trim());
+          }
           const res = await fetch("/api/process", { method: "POST", body: formData });
           if (!res.ok) {
             const errData = await res.json().catch(() => ({ error: "Processing failed" }));
@@ -196,13 +205,21 @@ function FileToolUI({ tool, category }: { tool: any; category: any }) {
       "watermark-pdf": "pdf", "image-to-pdf": "pdf", "protect-pdf": "pdf",
       "compress-pdf": "pdf", "pdf-to-word": "docx", "pdf-to-image": "png",
       "remove-bg": "png", "compress-image": "jpg", "resize-image": "png", "crop-image": "png",
+      "markdown-to-pdf": "pdf", "extract-text-from-audio": "txt",
     };
     let ext = tool.id === "convert-image" ? targetFormat : (extMap[tool.id] || "file");
     if (!ext && files.length > 0) {
       const origName = files[0].name;
       ext = origName.includes(".") ? origName.split(".").pop()! : "jpg";
     }
-    saveAs(result, `nestdoc_${tool.id}.${ext || "file"}`);
+    // For tools that operate on a single source file, carry the original
+    // basename through to the result. Falls back to the generic name if there
+    // is no source file (e.g., generators) or the tool produces multiple files.
+    const sourceName = files.length === 1 ? files[0].name.replace(/\.[^.]+$/, "") : "";
+    const filename = sourceName
+      ? `${sourceName}.${ext || "file"}`
+      : `nestdoc_${tool.id}.${ext || "file"}`;
+    saveAs(result, filename);
     trackEvent("file_downloaded", { tool_id: tool.id, file_size: result.size });
   };
 
@@ -256,6 +273,12 @@ function FileToolUI({ tool, category }: { tool: any; category: any }) {
           {tool.id === "protect-pdf" && (
             <OptionGroup label="Password">
               <TextInput value={pdfPassword} onChange={setPdfPassword} placeholder="Enter password..." type="password" />
+            </OptionGroup>
+          )}
+
+          {tool.id === "extract-text-from-audio" && (
+            <OptionGroup label="ElevenLabs API Key" hint="Get one at elevenlabs.io. Sent only with this request and never stored.">
+              <TextInput value={elevenLabsKey} onChange={setElevenLabsKey} placeholder="sk_..." type="password" />
             </OptionGroup>
           )}
 
